@@ -33,6 +33,75 @@ class _PlannedReplacement:
     fontname: str
     fontsize: float
     color: tuple[float, float, float]
+    text_align: str
+
+
+@dataclass(frozen=True)
+class _PageFontEntry:
+    resource_name: str
+    basefont: str
+    font_type: str
+    encoding: str
+
+
+_SANS_HINTS = (
+    "arial",
+    "helvetica",
+    "calibri",
+    "microsoftsansserif",
+    "segoe",
+    "verdana",
+    "tahoma",
+    "trebuchet",
+    "geneva",
+    "dejavusans",
+    "notosans",
+    "bitstreamverasans",
+    "frutiger",
+    "univers",
+    "gothic",
+    "kakugo",
+    "sans",
+)
+
+_SERIF_HINTS = (
+    "times",
+    "georgia",
+    "garamond",
+    "cambria",
+    "baskerville",
+    "palatino",
+    "bookman",
+    "dejavuserif",
+    "notoserif",
+    "libertine",
+    "song",
+    "mincho",
+    "heiseimin",
+    "serif",
+)
+
+_MONO_HINTS = (
+    "courier",
+    "consolas",
+    "monaco",
+    "lucidaconsole",
+    "menlo",
+    "dejavusansmono",
+    "firacode",
+    "sourcecodepro",
+    "jetbrainsmono",
+    "ibmplexmono",
+    "monospace",
+    "mono",
+)
+
+_BOLD_HINTS = ("bold", "black", "heavy", "demi", "semibold")
+_ITALIC_HINTS = ("italic", "oblique", "slanted")
+_BUILTIN_FONT_KEYS = {
+    "".join(char for char in str(name).casefold() if char.isalnum())
+    for name in (*fitz.Base14_fontdict.keys(), *fitz.Base14_fontdict.values())
+}
 
 
 def _int_to_rgb(value: int) -> tuple[float, float, float]:
@@ -57,42 +126,158 @@ def _normalize_font_key(font_name: str) -> str:
     return "".join(char for char in font_name.casefold() if char.isalnum())
 
 
-def _get_page_font_entries(page: fitz.Page) -> list[tuple[str, str]]:
-    entries: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+def _contains_any(text: str, hints: tuple[str, ...]) -> bool:
+    return any(hint in text for hint in hints)
+
+
+def _is_direct_insert_font(entry: _PageFontEntry) -> bool:
+    font_type = entry.font_type.casefold()
+    encoding = entry.encoding.casefold()
+
+    if font_type == "type0":
+        return False
+    if encoding.startswith("identity"):
+        return False
+    return True
+
+
+def _pick_builtin_fallback(*font_names: str) -> str:
+    keys = " ".join(_normalize_font_key(name) for name in font_names if name)
+    is_bold = _contains_any(keys, _BOLD_HINTS)
+    is_italic = _contains_any(keys, _ITALIC_HINTS)
+
+    if _contains_any(keys, _MONO_HINTS):
+        if is_bold and is_italic:
+            return "cobi"
+        if is_bold:
+            return "cobo"
+        if is_italic:
+            return "coit"
+        return "cour"
+
+    if _contains_any(keys, _SANS_HINTS):
+        if is_bold and is_italic:
+            return "hebi"
+        if is_bold:
+            return "hebo"
+        if is_italic:
+            return "heit"
+        return "helv"
+
+    if _contains_any(keys, _SERIF_HINTS):
+        if is_bold and is_italic:
+            return "tibi"
+        if is_bold:
+            return "tibo"
+        if is_italic:
+            return "tiit"
+        return "tiro"
+
+    if is_bold and is_italic:
+        return "hebi"
+    if is_bold:
+        return "hebo"
+    if is_italic:
+        return "heit"
+    return "helv"
+
+
+def _measure_text_width(text: str, fontname: str, fontsize: float) -> float | None:
+    font_key = _normalize_font_key(fontname)
+    if font_key not in _BUILTIN_FONT_KEYS:
+        return None
+
+    try:
+        return float(fitz.get_text_length(text, fontname=fontname, fontsize=fontsize))
+    except Exception:
+        return None
+
+
+def _pick_text_alignment(line_text: str, start: int, end: int) -> str:
+    leading_text = line_text[:start].strip()
+    trailing_text = line_text[end:].strip()
+
+    if trailing_text and not leading_text:
+        return "right"
+    if leading_text and trailing_text:
+        return "center"
+    return "left"
+
+
+def _adjust_text_origin(replacement: _PlannedReplacement) -> fitz.Point:
+    text_width = _measure_text_width(
+        replacement.target,
+        replacement.fontname,
+        replacement.fontsize,
+    )
+    if text_width is None or text_width >= replacement.rect.width:
+        return replacement.origin
+
+    if replacement.text_align == "right":
+        x_pos = replacement.rect.x1 - text_width
+    elif replacement.text_align == "center":
+        x_pos = replacement.rect.x0 + (replacement.rect.width - text_width) / 2
+    else:
+        x_pos = replacement.origin.x
+
+    x_pos = max(replacement.rect.x0, x_pos)
+    return fitz.Point(x_pos, replacement.origin.y)
+
+
+def _get_page_font_entries(page: fitz.Page) -> dict[str, _PageFontEntry]:
+    entries: dict[str, _PageFontEntry] = {}
 
     for font in page.get_fonts():
         if len(font) < 5:
             continue
-        _, _, _, basefont, resource_name, *_ = font
-        preferred = str(resource_name or basefont or "")
-        if not preferred:
+        _, _, font_type, basefont, resource_name, *rest = font
+        encoding = str(rest[0]) if rest else ""
+        entry = _PageFontEntry(
+            resource_name=str(resource_name or ""),
+            basefont=str(basefont or ""),
+            font_type=str(font_type or ""),
+            encoding=encoding,
+        )
+
+        if not entry.resource_name and not entry.basefont:
             continue
 
-        for candidate in (resource_name, basefont, _strip_subset_prefix(str(basefont or ""))):
+        for candidate in (
+            entry.resource_name,
+            entry.basefont,
+            _strip_subset_prefix(entry.basefont),
+        ):
             key = _normalize_font_key(str(candidate or ""))
-            item = (key, preferred)
-            if not key or item in seen:
+            if not key or key in entries:
                 continue
-            entries.append(item)
-            seen.add(item)
+            entries[key] = entry
 
     return entries
 
 
-def _resolve_fontname(font_entries: list[tuple[str, str]], span_font: str) -> str:
+def _find_font_entry(font_entries: dict[str, _PageFontEntry], span_font: str) -> _PageFontEntry | None:
     span_key = _normalize_font_key(span_font)
 
     if span_key:
-        for entry_key, fontname in font_entries:
-            if entry_key == span_key:
-                return fontname
+        if span_key in font_entries:
+            return font_entries[span_key]
 
-        for entry_key, fontname in font_entries:
+        for entry_key, entry in font_entries.items():
             if span_key in entry_key or entry_key in span_key:
-                return fontname
+                return entry
 
-    return str(span_font or "helv")
+    return None
+
+
+def _resolve_fontname(font_entries: dict[str, _PageFontEntry], span_font: str) -> str:
+    entry = _find_font_entry(font_entries, span_font)
+    if entry is None:
+        return _pick_builtin_fallback(span_font)
+
+    if _is_direct_insert_font(entry):
+        return entry.resource_name or _pick_builtin_fallback(entry.basefont, span_font)
+
+    return _pick_builtin_fallback(entry.basefont, span_font, entry.resource_name)
 
 
 def _iter_line_chars(page: fitz.Page) -> Iterable[list[_LineChar]]:
@@ -213,6 +398,7 @@ def _plan_page_replacements(
                         fontname=first_char.fontname,
                         fontsize=first_char.fontsize,
                         color=first_char.color,
+                        text_align=_pick_text_alignment(line_text, start, end),
                     )
                 )
 
@@ -254,9 +440,10 @@ def replace_text_in_pdf(
 
             for replacement in replacements:
                 if replacement.target:
+                    draw_origin = _adjust_text_origin(replacement)
                     try:
                         page.insert_text(
-                            replacement.origin,
+                            draw_origin,
                             replacement.target,
                             fontsize=replacement.fontsize,
                             fontname=replacement.fontname,
@@ -265,7 +452,7 @@ def replace_text_in_pdf(
                         )
                     except Exception:
                         page.insert_text(
-                            replacement.origin,
+                            draw_origin,
                             replacement.target,
                             fontsize=replacement.fontsize,
                             fontname="helv",

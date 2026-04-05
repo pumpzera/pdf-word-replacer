@@ -4,6 +4,7 @@ from pathlib import Path
 
 import fitz
 import pytest
+import reportlab
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
@@ -18,6 +19,18 @@ def _make_sample_pdf(path: Path) -> None:
     pdf.setFont("Times-Roman", 18)
     pdf.drawString(72, 740, "Owner Marco")
     pdf.save()
+
+
+def _make_type0_font_pdf(path: Path) -> None:
+    font_path = Path(reportlab.__file__).resolve().parent / "fonts" / "Vera.ttf"
+    doc = fitz.open()
+    try:
+        page = doc.new_page()
+        page.insert_font(fontname="FBUF0", fontbuffer=font_path.read_bytes())
+        page.insert_text((72, 72), "NATURAL DIAMOND", fontsize=16, fontname="FBUF0")
+        doc.save(path)
+    finally:
+        doc.close()
 
 
 def _find_substring_origin(path: Path, needle: str) -> tuple[float, float]:
@@ -57,6 +70,19 @@ def _find_span_style(path: Path, needle: str) -> tuple[str, float]:
         doc.close()
 
     raise AssertionError(f"Span not found: {needle}")
+
+
+def _find_search_rect(path: Path, needle: str) -> fitz.Rect:
+    doc = fitz.open(path)
+    try:
+        for page in doc:
+            rects = page.search_for(needle)
+            if rects:
+                return fitz.Rect(rects[0])
+    finally:
+        doc.close()
+
+    raise AssertionError(f"Search rect not found: {needle}")
 
 
 def test_replace_text_in_pdf(tmp_path: Path) -> None:
@@ -112,3 +138,39 @@ def test_replace_text_in_pdf(tmp_path: Path) -> None:
     assert burak_size == pytest.approx(16.0, abs=0.01)
     assert garden_size == pytest.approx(16.0, abs=0.01)
     assert luca_size == pytest.approx(18.0, abs=0.01)
+
+
+def test_replace_text_in_pdf_falls_back_for_type0_fonts(tmp_path: Path) -> None:
+    input_pdf = tmp_path / "type0-input.pdf"
+    output_pdf = tmp_path / "type0-output.pdf"
+    _make_type0_font_pdf(input_pdf)
+
+    results = replace_text_in_pdf(
+        input_pdf,
+        output_pdf,
+        [ReplacementRule("NATURAL", "FAKE")],
+    )
+
+    assert output_pdf.exists()
+    assert results["NATURAL"] >= 1
+
+    doc = fitz.open(output_pdf)
+    try:
+        text = "\n".join(page.get_text() for page in doc)
+    finally:
+        doc.close()
+
+    assert "FAKE" in text
+    assert "NATURAL" not in text
+
+    natural_origin = _find_substring_origin(input_pdf, "NATURAL")
+    fake_origin = _find_substring_origin(output_pdf, "FAKE")
+    fake_font, fake_size = _find_span_style(output_pdf, "FAKE")
+    fake_rect = _find_search_rect(output_pdf, "FAKE")
+    diamond_rect = _find_search_rect(output_pdf, "DIAMOND")
+
+    assert fake_origin[1] == pytest.approx(natural_origin[1], abs=0.01)
+    assert fake_font == "Helvetica"
+    assert fake_size == pytest.approx(16.0, abs=0.01)
+    assert fake_origin[0] > natural_origin[0]
+    assert diamond_rect.x0 - fake_rect.x1 < 10

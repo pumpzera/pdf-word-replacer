@@ -7,7 +7,9 @@ Python CLI tool that replaces visible text in text-based PDF files.
 - Replaces one or more words or short phrases in a PDF
 - Saves the edited PDF as a new file
 - Works best on selectable-text PDFs
-- Keeps the original font, font size, color, and text baseline when the match comes from the PDF text layer
+- Keeps the original font, font size, color, and text baseline when the original PDF font can be safely reused
+- Falls back to the closest built-in PDF font family when a custom embedded font would otherwise render invisibly
+- Tries to keep nearby word spacing natural when a shorter replacement would otherwise leave an ugly gap
 
 ## Super Simple Explanation
 
@@ -35,6 +37,70 @@ The original PDF is not changed unless you overwrite it on purpose.
 - This tool replaces visible text areas; it is not meant for legal or tamper-proof redaction
 - PDF line layout is not reflowed; longer replacements can overlap nearby content
 - No automatic font shrinking or stretching is applied, so the output keeps the original text sizing
+- Some embedded `Type0` / `Identity-H` / subset fonts may be replaced with the closest readable built-in PDF font instead of the exact original font
+
+## Supported Font Strategy
+
+This tool uses two font modes:
+
+- Direct reuse mode: if the PDF font can be safely reused, the tool keeps the original font style
+- Safe fallback mode: if the PDF uses a risky custom embedded font, the tool writes the replacement with the closest readable built-in PDF font
+
+### Directly reused when possible
+
+- Standard PDF fonts such as `Helvetica`, `Times-Roman`, and `Courier`
+- Many embedded `TrueType` fonts that PyMuPDF can reuse safely
+
+### Fallback font families
+
+If the original font cannot be safely reused, the tool maps it to one of the standard PDF families below.
+
+Sans-style fonts map to the Helvetica family:
+
+- Arial
+- Helvetica
+- Calibri
+- Segoe UI
+- Microsoft Sans Serif
+- Verdana
+- Tahoma
+- Trebuchet MS
+- Geneva
+- DejaVu Sans
+- Noto Sans
+- Bitstream Vera Sans
+- Frutiger
+- Univers
+- Gothic / KakuGo style names
+
+Serif-style fonts map to the Times family:
+
+- Times New Roman
+- Georgia
+- Garamond
+- Cambria
+- Baskerville
+- Palatino
+- Bookman
+- DejaVu Serif
+- Noto Serif
+- Libertine
+- Mincho / Song style names
+
+Monospace fonts map to the Courier family:
+
+- Courier New
+- Consolas
+- Monaco
+- Lucida Console
+- Menlo
+- DejaVu Sans Mono
+- Fira Code
+- Source Code Pro
+- JetBrains Mono
+- IBM Plex Mono
+
+Bold and italic styles are preserved when the original font name exposes that information.
 
 ## Install
 
