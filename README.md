@@ -7,14 +7,15 @@ Python CLI tool that replaces visible text in text-based PDF files.
 - Replaces one or more words or short phrases in a PDF
 - Saves the edited PDF as a new file
 - Works best on selectable-text PDFs
+- Keeps the original font, font size, color, and text baseline when the match comes from the PDF text layer
 
 ## Limitations
 
 - Scanned/image-only PDFs are not supported unless OCR text already exists
-- Complex layouts, custom fonts, and tightly packed text may need manual review
+- Complex layouts and text split across multiple drawing objects may still need manual review
 - This tool replaces visible text areas; it is not meant for legal or tamper-proof redaction
-- PDF line layout is not reflowed; shorter replacements can leave extra spacing
-- For cleaner results in tight layouts, replace whole phrases instead of single words
+- PDF line layout is not reflowed; longer replacements can overlap nearby content
+- No automatic font shrinking or stretching is applied, so the output keeps the original text sizing
 
 ## Install
 
@@ -34,6 +35,12 @@ Replace a single word:
 
 ```bash
 pdf-word-replacer input.pdf output.pdf --replace old=new
+```
+
+Or run it as a module:
+
+```bash
+python -m pdf_word_replacer.cli input.pdf output.pdf --replace old=new
 ```
 
 Replace multiple words:
@@ -70,4 +77,4 @@ pdf-word-replacer contract.pdf contract-edited.pdf --replace John=Jane --replace
 
 - Original file is never modified
 - Output PDF is written to the path you choose
-- Exact visual results depend on the original PDF structure
+- Exact visual results still depend on how the original PDF stores its text

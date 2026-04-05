@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Iterable
 
 import fitz
@@ -13,6 +14,27 @@ class ReplacementRule:
     target: str
 
 
+@dataclass(frozen=True)
+class _LineChar:
+    text: str
+    rect: fitz.Rect
+    origin: fitz.Point
+    fontname: str
+    fontsize: float
+    color: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class _PlannedReplacement:
+    source: str
+    target: str
+    rect: fitz.Rect
+    origin: fitz.Point
+    fontname: str
+    fontsize: float
+    color: tuple[float, float, float]
+
+
 def _int_to_rgb(value: int) -> tuple[float, float, float]:
     red = ((value >> 16) & 255) / 255
     green = ((value >> 8) & 255) / 255
@@ -20,72 +42,184 @@ def _int_to_rgb(value: int) -> tuple[float, float, float]:
     return (red, green, blue)
 
 
-def _rect_intersects(a: fitz.Rect, b: fitz.Rect) -> bool:
-    return not (a.x1 < b.x0 or a.x0 > b.x1 or a.y1 < b.y0 or a.y0 > b.y1)
+def _strip_subset_prefix(font_name: str) -> str:
+    if "+" not in font_name:
+        return font_name
+
+    prefix, suffix = font_name.split("+", 1)
+    if len(prefix) == 6 and prefix.isalpha() and prefix.isupper():
+        return suffix
+    return font_name
 
 
-def _find_span_style(page: fitz.Page, rect: fitz.Rect) -> tuple[float, tuple[float, float, float]]:
-    text = page.get_text("dict")
-    best_size = 11.0
-    best_color = (0.0, 0.0, 0.0)
+def _normalize_font_key(font_name: str) -> str:
+    font_name = _strip_subset_prefix(str(font_name or ""))
+    return "".join(char for char in font_name.casefold() if char.isalnum())
+
+
+def _get_page_font_entries(page: fitz.Page) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for font in page.get_fonts():
+        if len(font) < 5:
+            continue
+        _, _, _, basefont, resource_name, *_ = font
+        preferred = str(resource_name or basefont or "")
+        if not preferred:
+            continue
+
+        for candidate in (resource_name, basefont, _strip_subset_prefix(str(basefont or ""))):
+            key = _normalize_font_key(str(candidate or ""))
+            item = (key, preferred)
+            if not key or item in seen:
+                continue
+            entries.append(item)
+            seen.add(item)
+
+    return entries
+
+
+def _resolve_fontname(font_entries: list[tuple[str, str]], span_font: str) -> str:
+    span_key = _normalize_font_key(span_font)
+
+    if span_key:
+        for entry_key, fontname in font_entries:
+            if entry_key == span_key:
+                return fontname
+
+        for entry_key, fontname in font_entries:
+            if span_key in entry_key or entry_key in span_key:
+                return fontname
+
+    return str(span_font or "helv")
+
+
+def _iter_line_chars(page: fitz.Page) -> Iterable[list[_LineChar]]:
+    font_entries = _get_page_font_entries(page)
+    text = page.get_text("rawdict")
 
     for block in text.get("blocks", []):
         for line in block.get("lines", []):
+            line_chars: list[_LineChar] = []
             for span in line.get("spans", []):
-                span_bbox = span.get("bbox")
-                if not span_bbox:
-                    continue
-                span_rect = fitz.Rect(span_bbox)
-                if not _rect_intersects(rect, span_rect):
-                    continue
-                size = float(span.get("size", best_size))
+                fontname = _resolve_fontname(font_entries, str(span.get("font", "")))
+                fontsize = float(span.get("size", 11.0))
                 color = _int_to_rgb(int(span.get("color", 0)))
-                return size, color
 
-    return best_size, best_color
+                for char in span.get("chars", []):
+                    glyph = str(char.get("c", ""))
+                    bbox = char.get("bbox")
+                    origin = char.get("origin")
+                    if not glyph or not bbox or not origin:
+                        continue
+
+                    line_chars.append(
+                        _LineChar(
+                            text=glyph,
+                            rect=fitz.Rect(bbox),
+                            origin=fitz.Point(origin),
+                            fontname=fontname,
+                            fontsize=fontsize,
+                            color=color,
+                        )
+                    )
+
+            if line_chars:
+                yield line_chars
 
 
-def _fit_font_size(rect: fitz.Rect, text: str, base_size: float) -> float:
-    if not text:
-        return base_size
+def _build_line_text(line_chars: list[_LineChar]) -> tuple[str, list[tuple[int, int]]]:
+    text_parts: list[str] = []
+    char_ranges: list[tuple[int, int]] = []
+    cursor = 0
 
-    size = max(base_size, 6.0)
-    usable_width = max(rect.width - 2, 4)
-    usable_height = max(rect.height - 1, 4)
+    for line_char in line_chars:
+        text_parts.append(line_char.text)
+        next_cursor = cursor + len(line_char.text)
+        char_ranges.append((cursor, next_cursor))
+        cursor = next_cursor
 
-    while size >= 6.0:
-        text_width = fitz.get_text_length(text, fontname="helv", fontsize=size)
-        if text_width <= usable_width and size <= usable_height * 0.95:
-            return size
-        size -= 0.5
-
-    return 6.0
+    return "".join(text_parts), char_ranges
 
 
-def _collect_phrase_hits(
+def _find_text_matches(source_text: str, needle: str, ignore_case: bool) -> list[tuple[int, int]]:
+    if not needle:
+        return []
+
+    flags = re.IGNORECASE if ignore_case else 0
+    return [(match.start(), match.end()) for match in re.finditer(re.escape(needle), source_text, flags)]
+
+
+def _text_range_to_char_range(
+    char_ranges: list[tuple[int, int]],
+    start: int,
+    end: int,
+) -> tuple[int, int] | None:
+    first_index: int | None = None
+    last_index: int | None = None
+
+    for index, (char_start, char_end) in enumerate(char_ranges):
+        if char_end <= start:
+            continue
+        if char_start >= end:
+            break
+        if first_index is None:
+            first_index = index
+        last_index = index + 1
+
+    if first_index is None or last_index is None:
+        return None
+
+    return first_index, last_index
+
+
+def _merge_rects(chars: list[_LineChar]) -> fitz.Rect:
+    rect = fitz.Rect(chars[0].rect)
+    for line_char in chars[1:]:
+        rect.include_rect(line_char.rect)
+    return rect
+
+
+def _plan_page_replacements(
     page: fitz.Page,
-    source: str,
+    rules: Iterable[ReplacementRule],
     ignore_case: bool,
-) -> list[fitz.Rect]:
-    hits: list[fitz.Rect] = []
-    if not source.strip():
-        return hits
+) -> list[_PlannedReplacement]:
+    planned: list[_PlannedReplacement] = []
 
-    if not ignore_case:
-        return list(page.search_for(source))
+    for line_chars in _iter_line_chars(page):
+        line_text, char_ranges = _build_line_text(line_chars)
+        occupied = [False] * len(line_chars)
 
-    needle = source.casefold()
-    for rect in page.search_for(source):
-        hits.append(rect)
+        for rule in rules:
+            for start, end in _find_text_matches(line_text, rule.source, ignore_case):
+                char_range = _text_range_to_char_range(char_ranges, start, end)
+                if char_range is None:
+                    continue
 
-    words = page.get_text("words")
-    for x0, y0, x1, y1, word, *_ in words:
-        if str(word).casefold() == needle:
-            rect = fitz.Rect(x0, y0, x1, y1)
-            if not any(existing.contains(rect) or existing == rect for existing in hits):
-                hits.append(rect)
+                char_start, char_end = char_range
+                if any(occupied[char_start:char_end]):
+                    continue
 
-    return hits
+                matched_chars = line_chars[char_start:char_end]
+                first_char = matched_chars[0]
+                planned.append(
+                    _PlannedReplacement(
+                        source=rule.source,
+                        target=rule.target,
+                        rect=_merge_rects(matched_chars),
+                        origin=fitz.Point(first_char.origin),
+                        fontname=first_char.fontname,
+                        fontsize=first_char.fontsize,
+                        color=first_char.color,
+                    )
+                )
+
+                for index in range(char_start, char_end):
+                    occupied[index] = True
+
+    return planned
 
 
 def replace_text_in_pdf(
@@ -110,31 +244,35 @@ def replace_text_in_pdf(
 
     try:
         for page in doc:
-            for rule in rules:
-                for rect in _collect_phrase_hits(page, rule.source, ignore_case):
-                    font_size, color = _find_span_style(page, rect)
-                    page.add_redact_annot(rect, fill=(1, 1, 1))
-                    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            replacements = _plan_page_replacements(page, rules, ignore_case)
+            if not replacements:
+                continue
 
-                    write_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y1)
-                    fitted_size = _fit_font_size(write_rect, rule.target, font_size)
-                    inserted = page.insert_textbox(
-                        write_rect,
-                        rule.target,
-                        fontsize=fitted_size,
-                        fontname="helv",
-                        color=color,
-                        align=fitz.TEXT_ALIGN_LEFT,
-                    )
-                    if inserted < 0:
+            for replacement in replacements:
+                page.add_redact_annot(replacement.rect, fill=(1, 1, 1))
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+            for replacement in replacements:
+                if replacement.target:
+                    try:
                         page.insert_text(
-                            fitz.Point(write_rect.x0, write_rect.y1 - 1),
-                            rule.target,
-                            fontsize=fitted_size,
-                            fontname="helv",
-                            color=color,
+                            replacement.origin,
+                            replacement.target,
+                            fontsize=replacement.fontsize,
+                            fontname=replacement.fontname,
+                            color=replacement.color,
+                            overlay=True,
                         )
-                    applied[rule.source] += 1
+                    except Exception:
+                        page.insert_text(
+                            replacement.origin,
+                            replacement.target,
+                            fontsize=replacement.fontsize,
+                            fontname="helv",
+                            color=replacement.color,
+                            overlay=True,
+                        )
+                applied[replacement.source] += 1
 
         doc.save(output_path, garbage=4, deflate=True)
     finally:
